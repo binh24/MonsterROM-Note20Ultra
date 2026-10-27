@@ -1,0 +1,195 @@
+name: Seventeen full builds
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: Device to build
+        required: true
+        default: all
+        type: choice
+        options: [all, o1s, t2s, p3s, r9s]
+  push:
+    branches: ['seventeen']
+    paths:
+      - '.github/workflows/seventeen-build.yml'
+      - '.gitmodules'
+      - 'buildenv.sh'
+      - 'external/**'
+      - 'platform/exynos2100/**'
+      - 'prebuilts/**'
+      - 'scripts/**'
+      - 'target/o1s/**'
+      - 'target/t2s/**'
+      - 'target/p3s/**'
+      - 'target/r9s/**'
+      - 'unica/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ inputs.target || 'all' }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 360
+
+    strategy:
+      fail-fast: false
+      matrix:
+        target: ${{ fromJSON(github.event_name == 'workflow_dispatch' && inputs.target != 'all' && format('["{0}"]', inputs.target) || '["o1s","t2s","p3s","r9s"]') }}
+
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Free disk space (1/3)
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          sudo docker image prune --all --force
+          sudo docker builder prune -a --force
+
+      - name: Free disk space (2/3)
+        uses: jlumbroso/free-disk-space@main
+        with:
+          preinstalled-runtimes: true
+
+      - name: Free disk space (3/3)
+        uses: rokibhasansagar/slimhub_actions@main
+        with:
+          retain: 'compiler_cmake'
+
+      # slimhub removes dangling host symlinks under /home/runner. Android's
+      # absolute /apex and /system symlinks must be checked out after cleanup.
+      - name: Checkout repo
+        uses: actions/checkout@v7
+        with:
+          submodules: 'recursive'
+
+      - name: Set up build environment
+        env:
+          PLATFORM_KEY_PK8: ${{ secrets.PLATFORM_KEY_PK8 }}
+          PLATFORM_KEY_PEM: ${{ secrets.PLATFORM_KEY_PEM }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/unica-logs"
+          sudo apt update
+          sudo env DEBIAN_FRONTEND=noninteractive apt install -yq \
+            attr autoconf automake bc brotli build-essential ccache clang cmake curl \
+            ffmpeg flex fuse3 git libbrotli-dev libbz2-dev libfuse3-dev libgtest-dev \
+            liblz4-dev liblzma-dev libpcre2-dev libprotobuf-dev libssl-dev \
+            libtool libunwind-dev libzstd-dev \
+            lld lz4 ninja-build p7zip-full pkg-config protobuf-compiler \
+            python3-venv unzip uuid-dev webp zip zlib1g-dev
+          if ! sudo modprobe -a erofs f2fs; then
+            sudo env DEBIAN_FRONTEND=noninteractive apt install -yq "linux-modules-extra-$(uname -r)"
+            sudo modprobe -a erofs f2fs
+          fi
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ -n "$PLATFORM_KEY_PK8" ] && [ -n "$PLATFORM_KEY_PEM" ]; then
+            printf '%s' "$PLATFORM_KEY_PK8" | base64 --decode > security/unica_platform.pk8
+            printf '%s' "$PLATFORM_KEY_PEM" | base64 --decode > security/unica_platform.x509.pem
+          fi
+          df -h
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: Generate build config
+        run: |
+          source ./buildenv.sh "${{ matrix.target }}"
+          {
+            echo "DEBUG=$DEBUG"
+            echo "SRC_DIR=$SRC_DIR"
+            echo "OUT_DIR=$OUT_DIR"
+            echo "ODIN_DIR=$ODIN_DIR"
+            echo "FW_DIR=$FW_DIR"
+            echo "TOOLS_DIR=$TOOLS_DIR"
+            echo "APKTOOL_DIR=$APKTOOL_DIR"
+            echo "WORK_DIR=$WORK_DIR"
+            echo "TMP_DIR=$TMP_DIR"
+          } >> "$GITHUB_ENV"
+          sed -e "/Automatically/d" -e "s/\"//g" "$OUT_DIR/config.sh" >> "$GITHUB_ENV"
+          echo "$TOOLS_DIR/bin" >> "$GITHUB_PATH"
+
+      - name: Build dependencies
+        run: ./scripts/build_dependencies.sh |& tee "$RUNNER_TEMP/unica-logs/dependencies.log"
+
+      - name: Build Android 17 SELinux compiler
+        run: bash ./.github/scripts/build_secilc.sh |& tee "$RUNNER_TEMP/unica-logs/secilc.log"
+
+      - name: Download stock firmwares
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 90
+          max_attempts: 3
+          retry_on: error
+          command: bash -o pipefail -c './scripts/download_fw.sh |& tee -a "$RUNNER_TEMP/unica-logs/download.log"'
+
+      - name: Extract stock firmwares
+        run: |
+          ./scripts/extract_fw.sh |& tee "$RUNNER_TEMP/unica-logs/extract.log"
+          # The extracted trees contain everything needed by make_rom and the installers.
+          rm -rf "$ODIN_DIR"
+          df -h
+
+      - name: Build ROM and flashable ZIP
+        run: ./scripts/make_rom.sh -z |& tee "$RUNNER_TEMP/unica-logs/build.log"
+
+      - name: Verify build outputs
+        run: |
+          shopt -s nullglob
+          ROM_ZIPS=("$OUT_DIR"/UN1CA_*_"${{ matrix.target }}"*.zip)
+          test "${#ROM_ZIPS[@]}" -gt 0
+          for ZIP in "${ROM_ZIPS[@]}"; do
+            unzip -tq "$ZIP"
+            unzip -p "$ZIP" build_info.txt | tee "$RUNNER_TEMP/unica-logs/build_info.txt"
+            sha256sum "$ZIP" >> "$OUT_DIR/SHA256SUMS"
+          done
+
+      - name: Upload build outputs
+        uses: actions/upload-artifact@v7
+        with:
+          name: UN1CA-seventeen-${{ matrix.target }}-${{ github.sha }}
+          path: |
+            out/UN1CA_*_${{ matrix.target }}*.zip
+            out/SHA256SUMS
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Record build status
+        if: always()
+        env:
+          BUILD_STATUS: ${{ job.status }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/unica-logs"
+          {
+            echo "Device: ${{ matrix.target }}"
+            echo "Commit: $GITHUB_SHA"
+            echo "Status: $BUILD_STATUS"
+            echo "Run: $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
+            df -h
+          } | tee "$RUNNER_TEMP/unica-logs/status.txt" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Collect failed policy inputs
+        if: failure()
+        run: ./.github/scripts/collect_policy_diagnostics.sh
+
+      - name: Upload build logs
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: build-logs-${{ matrix.target }}-${{ github.sha }}
+          path: ${{ runner.temp }}/unica-logs/
+          if-no-files-found: warn
+          retention-days: 7
